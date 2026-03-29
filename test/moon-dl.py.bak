@@ -1,0 +1,1264 @@
+"""
+Ay Yüzeyi DL-ALT Rota Optimizasyonu
+====================================
+Deep Learning with A*, Landmarks, and Triangle inequality (DL-ALT)
+algoritmalarının Ay (Lunar) yüzeyindeki rover rota planlamasına uyarlanması.
+
+Özellikler:
+- 100×100 grid tabanlı arazi modeli (10.000 düğüm)
+- GNN ile topografik öneme dayalı landmark seçimi
+- Çok faktörlü maliyet fonksiyonu (eğim, enerji, pürüzlülük, tehlike, krater)
+- Zaman bağımlı gölge analizi (Time-Dependent A*)
+- PyCBC ile Doppler anomali tespiti (kuma batma, kayma, ani hareket)
+- YOLO krater tespiti ile no-go zone oluşturma
+- Gerçek Ay heightmap verisi desteği
+- Perlin noise + krater simülasyonu ile sentetik arazi üretimi (yedek)
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+import numpy as np
+import heapq
+import math
+import os
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+
+# ============================================================================
+# 1. DÜĞÜM MODELİ — AY YÜZEYİ NOKTASI
+# ============================================================================
+
+class AyDugumu:
+    """Ay yüzeyi üzerinde bir grid noktasını temsil eder."""
+    
+    def __init__(self, idx: str, grid_x: int, grid_y: int, 
+                 elevation: float = 0.0, roughness: float = 0.0):
+        self.idx = idx
+        self.grid_x = grid_x          # Grid x koordinatı
+        self.grid_y = grid_y          # Grid y koordinatı
+        self.elevation = elevation    # İrtifa (metre)
+        self.roughness = roughness    # Zemin pürüzlülüğü (0-1)
+        self.slope = 0.0              # Eğim (derece, komşulardan hesaplanır)
+        self.illumination = 1.0       # Güneşlenme oranı (0-1, zamana bağlı)
+        self.is_crater_rim = False    # Krater kenarı mı?
+        self.tehlike_skoru = 0.0      # PyCBC Doppler tehlike skoru (0-1)
+        self.krater_no_go = False     # YOLO krater tespiti no-go zone
+        self.komsular: List[Tuple['AyDugumu', float]] = []  # (düğüm, maliyet)
+    
+    def komsu_ekle(self, dugum: 'AyDugumu', maliyet: float):
+        self.komsular.append((dugum, maliyet))
+    
+    def __repr__(self):
+        return f"AyDugumu({self.grid_x},{self.grid_y} h={self.elevation:.1f}m)"
+
+
+# ============================================================================
+# 2. SENTETİK ARAZİ ÜRETİCİ — PERLİN NOISE + KRATER SİMÜLASYONU
+# ============================================================================
+
+class AyAraziUretici:
+    """Sentetik ay yüzeyi verisi üretir (heightmap + kraterler)."""
+    
+    def __init__(self, grid_boyutu: int = 100, seed: int = 42):
+        self.grid_boyutu = grid_boyutu
+        self.rng = np.random.RandomState(seed)
+    
+    def _perlin_noise_2d(self, shape: Tuple[int, int], res: Tuple[int, int]) -> np.ndarray:
+        """Basitleştirilmiş 2D Perlin noise üreteci."""
+        def f(t):
+            return 6*t**5 - 15*t**4 + 10*t**3
+        
+        delta = (res[0] / shape[0], res[1] / shape[1])
+        d = (shape[0] // res[0], shape[1] // res[1])
+        grid = np.mgrid[0:res[0]:delta[0], 0:res[1]:delta[1]].transpose(1, 2, 0) % 1
+        
+        # Rastgele gradyanlar
+        angles = 2 * np.pi * self.rng.rand(res[0]+1, res[1]+1)
+        gradients = np.dstack((np.cos(angles), np.sin(angles)))
+        
+        g00 = gradients[0:-1, 0:-1].repeat(d[0], 0).repeat(d[1], 1)
+        g10 = gradients[1:, 0:-1].repeat(d[0], 0).repeat(d[1], 1)
+        g01 = gradients[0:-1, 1:].repeat(d[0], 0).repeat(d[1], 1)
+        g11 = gradients[1:, 1:].repeat(d[0], 0).repeat(d[1], 1)
+        
+        # Dot product
+        n00 = np.sum(np.dstack((grid[:,:,0], grid[:,:,1])) * g00, 2)
+        n10 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1])) * g10, 2)
+        n01 = np.sum(np.dstack((grid[:,:,0], grid[:,:,1]-1)) * g01, 2)
+        n11 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1]-1)) * g11, 2)
+        
+        # İnterpolasyon
+        t = f(grid)
+        n0 = n00*(1-t[:,:,0]) + t[:,:,0]*n10
+        n1 = n01*(1-t[:,:,0]) + t[:,:,0]*n11
+        
+        return np.sqrt(2) * ((1-t[:,:,1])*n0 + t[:,:,1]*n1)
+    
+    def _krater_ekle(self, heightmap: np.ndarray, cx: int, cy: int, 
+                     yaricap: int, derinlik: float) -> np.ndarray:
+        """Heightmap'e krater ekler."""
+        boyut = heightmap.shape[0]
+        for y in range(max(0, cy - yaricap - 5), min(boyut, cy + yaricap + 5)):
+            for x in range(max(0, cx - yaricap - 5), min(boyut, cx + yaricap + 5)):
+                mesafe = np.sqrt((x - cx)**2 + (y - cy)**2)
+                if mesafe < yaricap:
+                    # Krater iç kısmı — çukur
+                    oran = mesafe / yaricap
+                    heightmap[y, x] -= derinlik * (1 - oran**2)
+                elif mesafe < yaricap * 1.3:
+                    # Krater kenarı — yükseltilmiş rim
+                    rim_oran = (mesafe - yaricap) / (yaricap * 0.3)
+                    heightmap[y, x] += derinlik * 0.3 * (1 - rim_oran**2)
+        return heightmap
+    
+    def arazi_uret(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Sentetik ay arazisi üretir.
+        
+        Returns:
+            heightmap: İrtifa haritası (metre)
+            roughness_map: Pürüzlülük haritası (0-1)
+            crater_rim_map: Krater kenarı boolean haritası
+        """
+        n = self.grid_boyutu
+        
+        # Temel arazi — çoklu frekanslı Perlin noise
+        heightmap = np.zeros((n, n))
+        # Grid boyutunun res'in katı olması gerekiyor
+        for octave, amplitude in [(4, 500), (8, 200), (16, 50)]:
+            if n % octave == 0:
+                noise = self._perlin_noise_2d((n, n), (octave, octave))
+                heightmap += amplitude * noise
+        
+        # Kraterler ekle
+        crater_rim_map = np.zeros((n, n), dtype=bool)
+        krater_sayisi = self.rng.randint(8, 15)
+        
+        for _ in range(krater_sayisi):
+            cx = self.rng.randint(10, n - 10)
+            cy = self.rng.randint(10, n - 10)
+            yaricap = self.rng.randint(5, 15)
+            derinlik = self.rng.uniform(50, 200)
+            
+            heightmap = self._krater_ekle(heightmap, cx, cy, yaricap, derinlik)
+            
+            # Krater kenarlarını işaretle
+            for y in range(max(0, cy - yaricap - 5), min(n, cy + yaricap + 5)):
+                for x in range(max(0, cx - yaricap - 5), min(n, cx + yaricap + 5)):
+                    mesafe = np.sqrt((x - cx)**2 + (y - cy)**2)
+                    if yaricap * 0.9 < mesafe < yaricap * 1.3:
+                        crater_rim_map[y, x] = True
+        
+        # Pürüzlülük haritası
+        roughness_map = np.abs(self._perlin_noise_2d((n, n), (16, 16)) 
+                               if n % 16 == 0 else self.rng.rand(n, n) * 0.5)
+        roughness_map = (roughness_map - roughness_map.min()) / (roughness_map.max() - roughness_map.min() + 1e-8)
+        
+        # Krater içlerinde pürüzlülük artır
+        for y in range(n):
+            for x in range(n):
+                if crater_rim_map[y, x]:
+                    roughness_map[y, x] = min(1.0, roughness_map[y, x] + 0.3)
+        
+        print(f"  Arazi üretildi: {n}×{n} grid")
+        print(f"  İrtifa aralığı: {heightmap.min():.1f}m — {heightmap.max():.1f}m")
+        print(f"  Krater sayısı: {krater_sayisi}")
+        
+        return heightmap, roughness_map, crater_rim_map
+
+
+class AyHeightmapYukleyici:
+    """
+    Gerçek Ay heightmap görselinden arazi verisi yükler.
+    PNG/JPG formatındaki grayscale heightmap'i okur, 100×100'e ölçekler,
+    krater kenarlarını gradyan analizinden otomatik tespit eder.
+    """
+    
+    def __init__(self, dosya_yolu: str, grid_boyutu: int = 100,
+                 irtifa_min: float = -2000.0, irtifa_max: float = 2000.0):
+        self.dosya_yolu = dosya_yolu
+        self.grid_boyutu = grid_boyutu
+        self.irtifa_min = irtifa_min  # Siyah (0) → minimum irtifa (metre)
+        self.irtifa_max = irtifa_max  # Beyaz (255) → maksimum irtifa (metre)
+    
+    def yukle(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Heightmap dosyasını yükler ve işler.
+        
+        Returns:
+            heightmap: İrtifa haritası (metre), grid_boyutu × grid_boyutu
+            roughness_map: Pürüzlülük haritası (0-1)
+            crater_rim_map: Krater kenarı boolean haritası
+        """
+        from PIL import Image
+        from scipy.ndimage import zoom, sobel, uniform_filter
+        
+        print(f"  Heightmap yükleniyor: {self.dosya_yolu}")
+        
+        # Görseli yükle ve grayscale'e çevir
+        img = Image.open(self.dosya_yolu).convert('L')  # Grayscale
+        img_array = np.array(img, dtype=np.float64)
+        
+        orijinal_boyut = img_array.shape
+        print(f"  Orijinal boyut: {orijinal_boyut[1]}×{orijinal_boyut[0]}")
+        
+        # Grid boyutuna ölçekle (bilinear interpolation)
+        scale_y = self.grid_boyutu / img_array.shape[0]
+        scale_x = self.grid_boyutu / img_array.shape[1]
+        img_scaled = zoom(img_array, (scale_y, scale_x), order=1)
+        
+        # 0-255 → irtifa (metre) dönüşümü
+        heightmap = self.irtifa_min + (img_scaled / 255.0) * (self.irtifa_max - self.irtifa_min)
+        
+        print(f"  Ölçeklenmiş boyut: {heightmap.shape[1]}×{heightmap.shape[0]}")
+        print(f"  İrtifa aralığı: {heightmap.min():.1f}m — {heightmap.max():.1f}m")
+        
+        # Krater kenarlarını otomatik tespit (yüksek gradyan bölgeleri)
+        grad_x = sobel(heightmap, axis=1)
+        grad_y = sobel(heightmap, axis=0)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # Gradyan büyüklüğü eşik değerini aş → krater kenarı
+        grad_threshold = np.percentile(gradient_magnitude, 85)  # En dik %15
+        crater_rim_map = gradient_magnitude > grad_threshold
+        
+        krater_piksel = np.sum(crater_rim_map)
+        print(f"  Tespit edilen krater kenarı pikselleri: {krater_piksel} "
+              f"(%{krater_piksel / crater_rim_map.size * 100:.1f})")
+        
+        # Pürüzlülük haritası — yerel irtifa varyansından
+        # Küçük pencerede standart sapma
+        pencere = 5
+        yerel_ortalama = uniform_filter(heightmap, size=pencere)
+        yerel_varyans = uniform_filter((heightmap - yerel_ortalama)**2, size=pencere)
+        roughness_raw = np.sqrt(np.maximum(yerel_varyans, 0.0))
+        
+        # 0-1'e normalize et
+        r_min, r_max = roughness_raw.min(), roughness_raw.max()
+        roughness_map = (roughness_raw - r_min) / (r_max - r_min + 1e-8)
+        
+        # Krater kenarlarında ekstra pürüzlülük
+        roughness_map[crater_rim_map] = np.clip(
+            roughness_map[crater_rim_map] + 0.2, 0, 1
+        )
+        
+        print(f"  Pürüzlülük aralığı: {roughness_map.min():.3f} — {roughness_map.max():.3f}")
+        
+        return heightmap, roughness_map, crater_rim_map
+
+
+# ============================================================================
+# X. YOLO KRATER TESPİTİ
+# ============================================================================
+
+class KraterTespitci:
+    """YOLO kullanarak Ay yüzeyindeki kraterleri tespit edip No-Go zone oluşturur."""
+    
+    def __init__(self, model_yolu: str = "models/moon.onnx", grid_boyutu: int = 100):
+        self.model_yolu = model_yolu
+        self.grid_boyutu = grid_boyutu
+    
+    def tespit_et(self, gorsel_yolu: str) -> np.ndarray:
+        """Görseldeki kraterleri bulup bool grid haritası döner."""
+        from ultralytics import YOLO
+        
+        print(f"  YOLO modeli yükleniyor: {self.model_yolu}")
+        model = YOLO(self.model_yolu, task='detect')
+        
+        print(f"  Krater tespiti yapılıyor: {gorsel_yolu}")
+        results = model(gorsel_yolu, verbose=False)
+        
+        krater_haritasi = np.zeros((self.grid_boyutu, self.grid_boyutu), dtype=bool)
+        
+        if not results or not getattr(results[0], 'boxes', None):
+            print("  Krater bulunamadı veya model çıktısı boş.")
+            return krater_haritasi
+        
+        orig_shape = results[0].orig_shape  # (height, width)
+        boxes = results[0].boxes
+        print(f"  {len(boxes)} krater tespit edildi.")
+        
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            
+            # Koordinatları grid boyutuna ölçekle
+            gx1 = int((x1 / orig_shape[1]) * self.grid_boyutu)
+            gx2 = int((x2 / orig_shape[1]) * self.grid_boyutu)
+            gy1 = int((y1 / orig_shape[0]) * self.grid_boyutu)
+            gy2 = int((y2 / orig_shape[0]) * self.grid_boyutu)
+            
+            # Sınırları koru
+            gx1, gx2 = max(0, gx1), min(self.grid_boyutu-1, gx2)
+            gy1, gy2 = max(0, gy1), min(self.grid_boyutu-1, gy2)
+            
+            # Krater çemberini (maske) oluştur
+            gx_center = (gx1 + gx2) // 2
+            gy_center = (gy1 + gy2) // 2
+            g_radius = min((gx2 - gx1) // 2, (gy2 - gy1) // 2)
+            
+            # Yarıçapı biraz genişletelim (güvenlik payı)
+            g_radius = max(1, int(g_radius * 1.2))
+            
+            for y in range(gy1, gy2 + 1):
+                for x in range(gx1, gx2 + 1):
+                    if (x - gx_center)**2 + (y - gy_center)**2 <= g_radius**2:
+                        krater_haritasi[y, x] = True
+        
+        print(f"  Krater no-go zone hücre sayısı: {np.sum(krater_haritasi)}")
+        return krater_haritasi
+
+
+# ============================================================================
+# Y. PYCBC DOPPLER ANOMALİ TESPİTİ
+# ============================================================================
+
+class RoverDopplerAnalizci:
+    """Rover tekerlek dönüş frekansını (Doppler kayması) mock data ile simüle eder ve 
+    PyCBC kütüphanesi ile anomalileri (kuma batma, kayma vb.) tespit eder."""
+    
+    def __init__(self, grid_boyutu: int = 100):
+        self.grid_boyutu = grid_boyutu
+        
+        # PyCBC kütüphaneleri
+        from pycbc.types import TimeSeries
+        from pycbc.filter import matched_filter
+        import numpy as np
+        
+        self.TimeSeries = TimeSeries
+        self.matched_filter = matched_filter
+        
+        self.sample_rate = 120
+        self.duration = 1.0
+        self.t = np.linspace(0, self.duration, int(self.sample_rate * self.duration))
+        
+        # Sinyal şablonu (Template): Sağlıklı zemin, sabit hız -> 10 Hz motor devri
+        template_data = np.cos(2 * np.pi * 10 * self.t)
+        self.template = self.TimeSeries(template_data, delta_t=1.0/self.sample_rate)
+    
+    def _anomali_skoru_hesapla(self, roughness: float, is_crater_rim: bool) -> float:
+        """Bir düğümdeki araç telemetrisini simüle eder ve PyCBC ile anomali skoru hesaplar."""
+        freq = 10.0
+        amp = 1.0
+        
+        # Tehlike durumlarına göre Doppler frekans kayması simülasyonu
+        if is_crater_rim:
+            freq = 4.0   # Lastik boşa döner/kayar, frekans değişir
+            amp = 1.5
+        elif roughness > 0.6:
+            freq = 10.0 - (roughness * 5.0)  # Kuma/regolite batma -> zorlanma, frekans düşer
+            amp = 0.5
+        
+        signal_data = amp * np.cos(2 * np.pi * freq * self.t)
+        
+        # Çevresel gürültü ekle (titreşim)
+        noise_level = max(0.1, roughness * 0.5)
+        noise_data = np.random.normal(0, noise_level, len(self.template))
+        
+        # PyCBC TimeSeries nesnesi
+        data = self.TimeSeries(signal_data + noise_data, delta_t=1.0/self.sample_rate)
+        
+        # Matched filter ile sinyal şablonunu data üzerinde ara
+        snr = self.matched_filter(self.template, data, psd=None, low_frequency_cutoff=1.0)
+        
+        max_snr = max(abs(snr))
+        
+        # İdeal koşullarda (template == sinyal) max SNR = ~60 bekleriz.
+        # Anomali derecesi, ideal SNR'dan ne kadar saptığımıza bağlı.
+        norm_snr = min(1.0, max_snr / 60.0)
+        anomaly = 1.0 - norm_snr
+        
+        return float(max(0.0, min(1.0, anomaly)))
+    
+    def tehlike_haritasi_olustur(self, heightmap: np.ndarray, 
+                                 roughness_map: np.ndarray, 
+                                 crater_rim_map: np.ndarray) -> np.ndarray:
+        """Tüm grid için Doppler anomali analizi çalıştırır."""
+        print("  PyCBC Doppler analizi yapılıyor (Sinyal işleme simülasyonu)...")
+        tehlike_haritasi = np.zeros((self.grid_boyutu, self.grid_boyutu))
+        
+        # Optimizasyon: Sadece riskli bölgeler için tam sinyal simülasyonu yapalım
+        # Çok düz bölgeleri hızlı geçelim ki saniyelerce beklemesin
+        for y in range(self.grid_boyutu):
+            for x in range(self.grid_boyutu):
+                roughness = roughness_map[y, x]
+                rim = crater_rim_map[y, x]
+                
+                if roughness > 0.1 or rim:
+                    tehlike_haritasi[y, x] = self._anomali_skoru_hesapla(roughness, rim)
+                else:
+                    tehlike_haritasi[y, x] = 0.05  # Temel düşük risk
+                    
+        print(f"  PyCBC Tehlike aralığı: {tehlike_haritasi.min():.2f} — {tehlike_haritasi.max():.2f}")
+        return tehlike_haritasi
+
+
+# ============================================================================
+# 3. AY YÜZEYİ GRAF SINIFI
+# ============================================================================
+
+class AyYuzeyi:
+    """Ay yüzeyini grid tabanlı graf olarak modeller."""
+    
+    # Maliyet fonksiyonu katsayıları
+    EGIM_KATSAYISI = 0.15        # α — eğim cezası
+    GOLGE_KATSAYISI = 2.0        # β — gölge/enerji cezası
+    PURUZLULUK_KATSAYISI = 1.5   # γ — pürüzlülük cezası
+    TEHLIKE_KATSAYISI = 3.0      # δ — PyCBC Doppler tehlike cezası
+    KRATER_CEZASI = 50.0         # Krater no-go zone çarpanı
+    KRATER_KENAR_CEZASI = 5.0    # Krater kenarı güvenlik çarpanı
+    HUCRE_BOYUTU = 100.0         # Her grid hücresinin gerçek boyutu (metre)
+    
+    def __init__(self, grid_boyutu: int = 100):
+        self.grid_boyutu = grid_boyutu
+        self.dugumler: Dict[str, AyDugumu] = {}
+        self.gunes_azimut = 45.0   # Güneş azimut açısı (derece)
+        self.gunes_yukseklik = 15.0  # Güneş yükseklik açısı (derece)
+    
+    @staticmethod
+    def _dugum_id(x: int, y: int) -> str:
+        return f"{x}_{y}"
+    
+    def graf_olustur(self, heightmap: np.ndarray, roughness_map: np.ndarray,
+                     crater_rim_map: np.ndarray):
+        """Heightmap'ten graf oluşturur."""
+        n = self.grid_boyutu
+        
+        # 1. Düğümleri oluştur
+        for y in range(n):
+            for x in range(n):
+                idx = self._dugum_id(x, y)
+                dugum = AyDugumu(
+                    idx=idx, grid_x=x, grid_y=y,
+                    elevation=heightmap[y, x],
+                    roughness=roughness_map[y, x]
+                )
+                dugum.is_crater_rim = crater_rim_map[y, x]
+                self.dugumler[idx] = dugum
+        
+        # 2. Eğimleri hesapla
+        self._egimleri_hesapla(heightmap)
+        
+        # 3. Güneşlenmeyi hesapla
+        self._guneslenme_hesapla(heightmap)
+        
+        # 4. Kenarlar — 8-connected grid
+        yonler = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+        
+        for y in range(n):
+            for x in range(n):
+                idx = self._dugum_id(x, y)
+                dugum = self.dugumler[idx]
+                
+                for dx, dy in yonler:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < n and 0 <= ny < n:
+                        komsu_idx = self._dugum_id(nx, ny)
+                        komsu = self.dugumler[komsu_idx]
+                        maliyet = self._maliyet_hesapla(dugum, komsu)
+                        dugum.komsu_ekle(komsu, maliyet)
+        
+        print(f"  Graf oluşturuldu: {len(self.dugumler)} düğüm, "
+              f"~{sum(len(d.komsular) for d in self.dugumler.values())} kenar")
+    
+    def _egimleri_hesapla(self, heightmap: np.ndarray):
+        """Her düğüm için eğim hesaplar (Sobel benzeri gradyan)."""
+        n = self.grid_boyutu
+        for y in range(n):
+            for x in range(n):
+                # Komşu yüksekliklere bakarak gradyan
+                dh_dx = 0.0
+                dh_dy = 0.0
+                count = 0
+                
+                for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < n and 0 <= ny < n:
+                        if dx != 0:
+                            dh_dx += (heightmap[ny, nx] - heightmap[y, x]) / self.HUCRE_BOYUTU
+                        if dy != 0:
+                            dh_dy += (heightmap[ny, nx] - heightmap[y, x]) / self.HUCRE_BOYUTU
+                        count += 1
+                
+                gradient = np.sqrt(dh_dx**2 + dh_dy**2)
+                slope_deg = np.degrees(np.arctan(gradient))
+                self.dugumler[self._dugum_id(x, y)].slope = slope_deg
+    
+    def _guneslenme_hesapla(self, heightmap: np.ndarray):
+        """Güneş açısına göre her düğümün güneşlenme oranını hesaplar."""
+        n = self.grid_boyutu
+        azimut_rad = np.radians(self.gunes_azimut)
+        yukseklik_rad = np.radians(self.gunes_yukseklik)
+        
+        # Güneş yönü vektörü
+        gunes_dx = np.cos(azimut_rad)
+        gunes_dy = np.sin(azimut_rad)
+        
+        for y in range(n):
+            for x in range(n):
+                idx = self._dugum_id(x, y)
+                dugum = self.dugumler[idx]
+                
+                # Basit gölge analizi: güneş yönündeki komşu daha yüksekse gölge
+                shadow_factor = 1.0
+                check_dist = 5  # Kaç hücre uzağa bakalım
+                
+                for d in range(1, check_dist + 1):
+                    check_x = int(x + gunes_dx * d)
+                    check_y = int(y + gunes_dy * d)
+                    
+                    if 0 <= check_x < n and 0 <= check_y < n:
+                        h_diff = heightmap[check_y, check_x] - heightmap[y, x]
+                        mesafe = d * self.HUCRE_BOYUTU
+                        blocking_angle = np.degrees(np.arctan2(h_diff, mesafe))
+                        
+                        if blocking_angle > self.gunes_yukseklik:
+                            shadow_factor *= 0.2  # Ciddi gölge
+                            break
+                
+                dugum.illumination = max(0.05, shadow_factor)
+    
+    def _maliyet_hesapla(self, u: AyDugumu, v: AyDugumu) -> float:
+        """
+        İki düğüm arasındaki geçiş maliyetini hesaplar.
+        
+        Cost = mesafe × eğim_faktörü × enerji_faktörü × tehlike_faktörü × krater_faktörü
+        """
+        # Öklid mesafesi (metre)
+        dx = (v.grid_x - u.grid_x) * self.HUCRE_BOYUTU
+        dy = (v.grid_y - u.grid_y) * self.HUCRE_BOYUTU
+        dh = v.elevation - u.elevation
+        mesafe_3d = np.sqrt(dx**2 + dy**2 + dh**2)
+        
+        # Eğim faktörü — dik yerlerden kaçınma
+        egim_ortalama = (u.slope + v.slope) / 2.0
+        egim_faktoru = 1.0 + self.EGIM_KATSAYISI * egim_ortalama
+        
+        # Enerji tüketimi faktörü
+        golge_cezasi = self.GOLGE_KATSAYISI * (1.0 - v.illumination)
+        puruzluluk_cezasi = self.PURUZLULUK_KATSAYISI * v.roughness
+        enerji_faktoru = 1.0 + golge_cezasi + puruzluluk_cezasi
+        
+        # PyCBC Doppler tehlike faktörü (kuma batma, kayma riski)
+        tehlike_faktoru = 1.0 + self.TEHLIKE_KATSAYISI * v.tehlike_skoru
+        
+        # YOLO krater no-go zone faktörü
+        if v.krater_no_go:
+            krater_faktoru = self.KRATER_CEZASI
+        elif v.is_crater_rim:
+            krater_faktoru = self.KRATER_KENAR_CEZASI
+        else:
+            krater_faktoru = 1.0
+        
+        # Toplam maliyet
+        return mesafe_3d * egim_faktoru * enerji_faktoru * tehlike_faktoru * krater_faktoru
+    
+    def set_tehlike_haritasi(self, tehlike_haritasi: np.ndarray):
+        """PyCBC Doppler analiz sonuçlarını düğümlere uygular."""
+        n = self.grid_boyutu
+        for y in range(n):
+            for x in range(n):
+                self.dugumler[self._dugum_id(x, y)].tehlike_skoru = tehlike_haritasi[y, x]
+    
+    def set_krater_haritasi(self, krater_haritasi: np.ndarray):
+        """YOLO krater tespiti sonuçlarını düğümlere uygular."""
+        n = self.grid_boyutu
+        for y in range(n):
+            for x in range(n):
+                self.dugumler[self._dugum_id(x, y)].krater_no_go = bool(krater_haritasi[y, x])
+    
+    def maliyetleri_guncelle(self, zaman_saat: float = 0.0):
+        """Zaman bağımlı maliyet güncellemesi (güneş konumu değişimi)."""
+        # Güneş açısını zamana göre güncelle (her 2 saatte ~15 derece)
+        self.gunes_azimut = (45.0 + zaman_saat * 7.5) % 360
+        self.gunes_yukseklik = max(2.0, 15.0 + 5.0 * np.sin(np.radians(zaman_saat * 15)))
+        
+        # Güneşlenmeyi yeniden hesapla
+        n = self.grid_boyutu
+        heightmap = np.zeros((n, n))
+        for y in range(n):
+            for x in range(n):
+                heightmap[y, x] = self.dugumler[self._dugum_id(x, y)].elevation
+        self._guneslenme_hesapla(heightmap)
+        
+        # Kenar maliyetlerini güncelle
+        for dugum in self.dugumler.values():
+            yeni_komsular = []
+            for komsu, _ in dugum.komsular:
+                yeni_maliyet = self._maliyet_hesapla(dugum, komsu)
+                yeni_komsular.append((komsu, yeni_maliyet))
+            dugum.komsular = yeni_komsular
+    
+    def dijkstra(self, baslangic_id: str, hedef_id: str = None) -> Dict[str, float]:
+        """Dijkstra algoritması — tek kaynak en kısa yol."""
+        self.son_ziyaret_edilen = 0
+        mesafeler = {baslangic_id: 0.0}
+        oncekiler = {baslangic_id: None}
+        heap = [(0.0, baslangic_id)]
+        
+        while heap:
+            self.son_ziyaret_edilen += 1
+            mevcut_mesafe, u_id = heapq.heappop(heap)
+            
+            if mevcut_mesafe > mesafeler.get(u_id, float('inf')):
+                continue
+            
+            if hedef_id and u_id == hedef_id:
+                break
+            
+            for komsu, maliyet in self.dugumler[u_id].komsular:
+                yeni_mesafe = mevcut_mesafe + maliyet
+                if yeni_mesafe < mesafeler.get(komsu.idx, float('inf')):
+                    mesafeler[komsu.idx] = yeni_mesafe
+                    oncekiler[komsu.idx] = u_id
+                    heapq.heappush(heap, (yeni_mesafe, komsu.idx))
+        
+        return mesafeler, oncekiler
+    
+    def dijkstra_rota_bul(self, baslangic_id: str, hedef_id: str) -> Optional[Tuple[List[AyDugumu], float]]:
+        """Dijkstra ile rota bulur."""
+        mesafeler, oncekiler = self.dijkstra(baslangic_id, hedef_id)
+        
+        if hedef_id not in mesafeler:
+            return None
+        
+        # Rotayı geri izle
+        rota = []
+        mevcut = hedef_id
+        while mevcut is not None:
+            rota.append(self.dugumler[mevcut])
+            mevcut = oncekiler.get(mevcut)
+        rota.reverse()
+        
+        return rota, mesafeler[hedef_id]
+
+
+# ============================================================================
+# 4. GNN LANDMARK SEÇİCİ — TOPOGRAFİK ÖNEM
+# ============================================================================
+
+class GNNLandmarkSecici(nn.Module):
+    """
+    Ay yüzeyi için geliştirilmiş GNN Landmark Seçici.
+    
+    Girdiler: [irtifa, eğim, güneşlenme, pürüzlülük, krater_kenarı, derece]
+    Çıktı: Her düğüm için önem skoru (0-1)
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 32):
+        super(GNNLandmarkSecici, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim // 2)
+        self.conv3 = GCNConv(hidden_dim // 2, 1)
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, data: Data) -> torch.Tensor:
+        x, edge_index = data.x, data.edge_index
+        
+        x = torch.relu(self.conv1(x, edge_index))
+        x = self.dropout(x)
+        x = torch.relu(self.conv2(x, edge_index))
+        x = self.dropout(x)
+        x = self.conv3(x, edge_index)
+        
+        return torch.sigmoid(x)  # 0-1 önem skoru
+
+
+# ============================================================================
+# 5. AY DL-ALT ALGORİTMASI
+# ============================================================================
+
+class AyDLALT:
+    """
+    Ay yüzeyi için DL-ALT (Deep Learning + A* + Landmarks + Triangle inequality)
+    rota optimizasyonu.
+    """
+    
+    def __init__(self, ay_yuzeyi: AyYuzeyi):
+        self.yuzey = ay_yuzeyi
+        self.landmarks: List[AyDugumu] = []
+        self.dist_from_landmarks: Dict[str, Dict[str, float]] = {}
+        self.gnn_model: Optional[GNNLandmarkSecici] = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def _graf_verisi_hazirla(self) -> Data:
+        """GNN için graf verisini hazırlar (topografik özelliklerle)."""
+        node_features = []
+        node_mapping = {}
+        dugum_listesi = list(self.yuzey.dugumler.values())
+        
+        # İrtifa normalizasyonu için min-max
+        irtifalar = [d.elevation for d in dugum_listesi]
+        h_min, h_max = min(irtifalar), max(irtifalar)
+        h_range = h_max - h_min if h_max != h_min else 1.0
+        
+        egimler = [d.slope for d in dugum_listesi]
+        s_max = max(egimler) if max(egimler) > 0 else 1.0
+        
+        for i, dugum in enumerate(dugum_listesi):
+            node_mapping[dugum.idx] = i
+            
+            features = [
+                (dugum.elevation - h_min) / h_range,   # Normalize irtifa
+                dugum.slope / s_max,                     # Normalize eğim
+                dugum.illumination,                      # Güneşlenme (zaten 0-1)
+                dugum.roughness,                         # Pürüzlülük (zaten 0-1)
+                1.0 if dugum.is_crater_rim else 0.0,    # Krater kenarı
+                len(dugum.komsular) / 8.0,              # Normalize derece
+            ]
+            node_features.append(features)
+        
+        # Kenar listesi — ALT örnekleme (tüm kenarlar çok fazla)
+        edge_index = []
+        for dugum in dugum_listesi:
+            i = node_mapping[dugum.idx]
+            for komsu, _ in dugum.komsular:
+                j = node_mapping[komsu.idx]
+                edge_index.append([i, j])
+        
+        x = torch.tensor(node_features, dtype=torch.float)
+        edge_idx = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        
+        return Data(x=x, edge_index=edge_idx).to(self.device), node_mapping
+    
+    def landmark_seciciyi_egit(self, epochs: int = 80):
+        """GNN landmark seçiciyi topografik özelliklere göre eğitir."""
+        print("\n  GNN Landmark Seçici eğitiliyor...")
+        
+        data, node_mapping = self._graf_verisi_hazirla()
+        input_dim = data.x.size(1)
+        
+        self.gnn_model = GNNLandmarkSecici(input_dim, hidden_dim=32).to(self.device)
+        optimizer = optim.Adam(self.gnn_model.parameters(), lr=0.005)
+        criterion = nn.BCELoss()
+        
+        # Hedef etiketler: topografik önem skoru
+        # Yüksek irtifa + krater kenarı + iyi güneşlenme + düşük eğim = yüksek önem
+        dugum_listesi = list(self.yuzey.dugumler.values())
+        
+        irtifalar = np.array([d.elevation for d in dugum_listesi])
+        irtifa_norm = (irtifalar - irtifalar.min()) / (irtifalar.max() - irtifalar.min() + 1e-8)
+        
+        hedef_skorlar = []
+        for i, dugum in enumerate(dugum_listesi):
+            skor = 0.0
+            skor += 0.3 * irtifa_norm[i]                           # Yüksek noktalar → iyi görüş
+            skor += 0.25 * dugum.illumination                      # Aydınlık bölgeler → enerji
+            skor += 0.25 * (1.0 - min(dugum.slope / 30.0, 1.0))   # Düşük eğim → erişilebilirlik
+            skor += 0.2 * (1.0 if dugum.is_crater_rim else 0.0)   # Krater kenarı → navigasyon
+            hedef_skorlar.append(min(skor, 1.0))
+        
+        target = torch.tensor(hedef_skorlar, dtype=torch.float).to(self.device).unsqueeze(1)
+        
+        # Eğitim döngüsü
+        self.gnn_model.train()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            out = self.gnn_model(data)
+            loss = criterion(out, target)
+            loss.backward()
+            optimizer.step()
+            
+            if epoch % 20 == 0:
+                print(f"    Epoch {epoch:3d}/{epochs}, Loss: {loss.item():.4f}")
+        
+        print(f"    Eğitim tamamlandı. Son loss: {loss.item():.4f}")
+    
+    def landmarklari_sec(self, k: int = 8):
+        """GNN ile en iyi landmark'ları seçer ve mesafeleri ön-hesaplar."""
+        if not self.gnn_model:
+            self.landmark_seciciyi_egit()
+        
+        data, node_mapping = self._graf_verisi_hazirla()
+        self.gnn_model.eval()
+        
+        with torch.no_grad():
+            onem_skorlari = self.gnn_model(data).cpu().numpy().flatten()
+        
+        # En yüksek önem skoruna sahip k düğümü seç
+        dugum_listesi = list(self.yuzey.dugumler.values())
+        sirali_indeksler = np.argsort(onem_skorlari)[::-1]
+        
+        # Minimum mesafe kısıtı — landmarklar birbirine çok yakın olmasın
+        min_mesafe = self.yuzey.grid_boyutu // (k // 2)
+        secilen = []
+        
+        for idx in sirali_indeksler:
+            dugum = dugum_listesi[idx]
+            
+            # Mevcut landmarklara yeterince uzak mı?
+            cok_yakin = False
+            for mevcut in secilen:
+                dx = dugum.grid_x - mevcut.grid_x
+                dy = dugum.grid_y - mevcut.grid_y
+                if np.sqrt(dx**2 + dy**2) < min_mesafe:
+                    cok_yakin = True
+                    break
+            
+            if not cok_yakin:
+                secilen.append(dugum)
+                if len(secilen) >= k:
+                    break
+        
+        self.landmarks = secilen
+        
+        print(f"\n  {len(self.landmarks)} landmark seçildi:")
+        for i, lm in enumerate(self.landmarks):
+            print(f"    L{i}: ({lm.grid_x},{lm.grid_y}) "
+                  f"h={lm.elevation:.0f}m, "
+                  f"eğim={lm.slope:.1f}°, "
+                  f"güneş={lm.illumination:.2f}, "
+                  f"skor={onem_skorlari[sirali_indeksler[i]]:.3f}")
+        
+        # Landmark mesafelerini ön-hesapla
+        print("\n  Landmark mesafeleri ön-hesaplanıyor...")
+        for i, landmark in enumerate(self.landmarks):
+            mesafeler, _ = self.yuzey.dijkstra(landmark.idx)
+            self.dist_from_landmarks[landmark.idx] = mesafeler
+            print(f"    Landmark {i+1}/{len(self.landmarks)} tamamlandı")
+    
+    def _dl_alt_heuristic(self, u: AyDugumu, v: AyDugumu) -> float:
+        """
+        Landmark bazlı sezgisel fonksiyon (admissible heuristic).
+        
+        Üçgen eşitsizliği: d(u,v) ≥ |d(L,u) - d(L,v)| tüm L landmarklar için.
+        """
+        max_h = 0.0
+        
+        for landmark in self.landmarks:
+            dist_lu = self.dist_from_landmarks[landmark.idx].get(u.idx, float('inf'))
+            dist_lv = self.dist_from_landmarks[landmark.idx].get(v.idx, float('inf'))
+            
+            if dist_lu == float('inf') or dist_lv == float('inf'):
+                continue
+            
+            h = abs(dist_lu - dist_lv)
+            if h > max_h:
+                max_h = h
+        
+        return max_h
+    
+    def dl_alt_rota_bul(self, baslangic_id: str, hedef_id: str, 
+                        zaman_saat: float = 0.0) -> Optional[Tuple[List[AyDugumu], float]]:
+        """
+        DL-ALT ile optimal rota bulur.
+        
+        Time-Dependent A* — güneş konumuna göre maliyet güncellenir.
+        """
+        if baslangic_id not in self.yuzey.dugumler or hedef_id not in self.yuzey.dugumler:
+            return None
+        
+        # Zaman bağımlı maliyet güncellemesi
+        if zaman_saat > 0:
+            self.yuzey.maliyetleri_guncelle(zaman_saat)
+        
+        # Landmark'ları seç (henüz seçilmediyse)
+        if not self.landmarks:
+            self.landmarklari_sec()
+        
+        baslangic = self.yuzey.dugumler[baslangic_id]
+        hedef = self.yuzey.dugumler[hedef_id]
+        
+        h_start = self._dl_alt_heuristic(baslangic, hedef)
+        open_set = [(h_start, 0.0, id(baslangic), baslangic_id)]
+        heapq.heapify(open_set)
+        
+        g_scores: Dict[str, float] = {baslangic_id: 0.0}
+        oncekiler: Dict[str, Optional[str]] = {baslangic_id: None}
+        ziyaret_sayisi = 0
+        
+        while open_set:
+            f_score, g_score, _, mevcut_id = heapq.heappop(open_set)
+            ziyaret_sayisi += 1
+            
+            if mevcut_id == hedef_id:
+                # Rotayı geri izle
+                rota = []
+                izlenen = hedef_id
+                while izlenen is not None:
+                    rota.append(self.yuzey.dugumler[izlenen])
+                    izlenen = oncekiler.get(izlenen)
+                rota.reverse()
+                
+                self.son_ziyaret_edilen = ziyaret_sayisi
+                print(f"  DL-ALT: {ziyaret_sayisi} düğüm ziyaret edildi")
+                return rota, g_score
+            
+            if g_score > g_scores.get(mevcut_id, float('inf')):
+                continue
+            
+            mevcut = self.yuzey.dugumler[mevcut_id]
+            
+            for komsu, maliyet in mevcut.komsular:
+                yeni_g = g_score + maliyet
+                
+                if yeni_g < g_scores.get(komsu.idx, float('inf')):
+                    g_scores[komsu.idx] = yeni_g
+                    oncekiler[komsu.idx] = mevcut_id
+                    h = self._dl_alt_heuristic(komsu, hedef)
+                    f = yeni_g + h
+                    heapq.heappush(open_set, (f, yeni_g, id(komsu), komsu.idx))
+        
+        return None
+
+
+# ============================================================================
+# 6. GÖRSELLEŞTİRME
+# ============================================================================
+
+class AyGorsellestirici:
+    """Matplotlib ile ay yüzeyi ve rota görselleştirmesi."""
+    
+    @staticmethod
+    def gorsellestir(ay_yuzeyi: AyYuzeyi, 
+                     rota_dlalt: Optional[List[AyDugumu]] = None,
+                     rota_dijkstra: Optional[List[AyDugumu]] = None,
+                     landmarks: Optional[List[AyDugumu]] = None,
+                     baslik: str = "Ay Yüzeyi Rota Optimizasyonu",
+                     kaydet: str = "lunar_route_result.png",
+                     orijinal_heightmap_dosya: Optional[str] = None):
+        """Ay yüzeyini ve rotaları görselleştirir."""
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        n = ay_yuzeyi.grid_boyutu
+        
+        # Haritaları çıkar
+        heightmap = np.zeros((n, n))
+        illumination_map = np.zeros((n, n))
+        slope_map = np.zeros((n, n))
+        # YENİ Haritaları çıkar
+        tehlike_map = np.zeros((n, n))
+        krater_map = np.zeros((n, n))
+        
+        for y in range(n):
+            for x in range(n):
+                dugum = ay_yuzeyi.dugumler[AyYuzeyi._dugum_id(x, y)]
+                heightmap[y, x] = dugum.elevation
+                illumination_map[y, x] = dugum.illumination
+                slope_map[y, x] = dugum.slope
+                roughness_map[y, x] = dugum.roughness
+                tehlike_map[y, x] = dugum.tehlike_skoru
+                krater_map[y, x] = 1.0 if dugum.krater_no_go else 0.0
+        
+        # Orijinal görsel
+        orijinal_img = None
+        if orijinal_heightmap_dosya and os.path.exists(orijinal_heightmap_dosya):
+            from PIL import Image
+            orijinal_img = np.array(Image.open(orijinal_heightmap_dosya).convert('L'))
+        
+        # 8 panel düzeni
+        fig = plt.figure(figsize=(24, 16))
+        fig.suptitle(baslik, fontsize=20, fontweight='bold', color='white', y=0.98)
+        fig.patch.set_facecolor('#0d1117')
+        
+        ax1 = fig.add_subplot(2, 4, 1)  # İrtifa
+        ax2 = fig.add_subplot(2, 4, 2)  # Güneşlenme
+        ax3 = fig.add_subplot(2, 4, 3)  # Eğim
+        ax4 = fig.add_subplot(2, 4, 4)  # Pürüzlülük
+        ax5 = fig.add_subplot(2, 4, 5)  # Tehlike (PyCBC)
+        ax6 = fig.add_subplot(2, 4, 6)  # YOLO Krater
+        ax7 = fig.add_subplot(2, 4, 7, projection='3d')  # 3D
+        if orijinal_img is not None:
+            ax8 = fig.add_subplot(2, 4, 8)  # Orijinal
+        else:
+            ax8 = None
+        
+        all_2d_axes = [ax1, ax2, ax3, ax4, ax5, ax6]
+        if ax8:
+            all_2d_axes.append(ax8)
+        
+        for ax in all_2d_axes:
+            ax.set_facecolor('#161b22')
+            ax.tick_params(colors='#8b949e', labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_color('#30363d')
+        
+        # ─── Yardımcı: Rotayı çiz ───
+        def _rota_ciz(ax, rota, renk='#58a6ff', stil='-', kalinlik=2.5, 
+                      etiket=None, scale_x=1.0, scale_y=1.0):
+            if rota:
+                rx = [d.grid_x * scale_x for d in rota]
+                ry = [d.grid_y * scale_y for d in rota]
+                ax.plot(rx, ry, color=renk, linestyle=stil, linewidth=kalinlik,
+                       label=etiket, zorder=5, alpha=0.9)
+        
+        def _baslangic_hedef_ciz(ax, rota, scale_x=1.0, scale_y=1.0):
+            if rota:
+                ax.plot(rota[0].grid_x * scale_x, rota[0].grid_y * scale_y, 
+                       marker='^', color='#3fb950', markersize=14, 
+                       markeredgecolor='white', markeredgewidth=1.5,
+                       label='Başlangıç', zorder=8)
+                ax.plot(rota[-1].grid_x * scale_x, rota[-1].grid_y * scale_y, 
+                       marker='v', color='#f85149', markersize=14,
+                       markeredgecolor='white', markeredgewidth=1.5,
+                       label='Hedef', zorder=8)
+        
+        def _landmark_ciz(ax, landmarks, scale_x=1.0, scale_y=1.0):
+            if landmarks:
+                lx = [lm.grid_x * scale_x for lm in landmarks]
+                ly = [lm.grid_y * scale_y for lm in landmarks]
+                ax.scatter(lx, ly, c='#d29922', s=120, marker='*', 
+                          edgecolors='white', linewidths=0.8, 
+                          label='Landmarks', zorder=7)
+        
+        # ─── Panel 1: İrtifa Haritası + Rotalar ───
+        im1 = ax1.imshow(heightmap, cmap='terrain', origin='lower', aspect='equal')
+        ax1.set_title('İrtifa Haritası + Rotalar', color='#e6edf3', 
+                      fontsize=11, fontweight='bold')
+        cb1 = plt.colorbar(im1, ax=ax1, shrink=0.8, pad=0.02)
+        cb1.set_label('İrtifa (m)', color='#8b949e', fontsize=8)
+        cb1.ax.tick_params(colors='#8b949e', labelsize=7)
+        
+        _rota_ciz(ax1, rota_dlalt, '#58a6ff', '-', 2.5, 'DL-ALT')
+        _rota_ciz(ax1, rota_dijkstra, '#bc8cff', '--', 2.0, 'Dijkstra')
+        _baslangic_hedef_ciz(ax1, rota_dlalt)
+        _landmark_ciz(ax1, landmarks)
+        
+        ax1.legend(loc='upper right', fontsize=7, facecolor='#161b22', 
+                  edgecolor='#30363d', labelcolor='#e6edf3', framealpha=0.9)
+        
+        # ─── Panel 2: Güneşlenme Haritası ───
+        im2 = ax2.imshow(illumination_map, cmap='inferno', origin='lower', 
+                         aspect='equal', vmin=0, vmax=1)
+        ax2.set_title('Güneşlenme Haritası', color='#e6edf3', fontsize=11, fontweight='bold')
+        cb2 = plt.colorbar(im2, ax=ax2, shrink=0.8, pad=0.02)
+        cb2.set_label('Güneşlenme (0-1)', color='#8b949e', fontsize=8)
+        cb2.ax.tick_params(colors='#8b949e', labelsize=7)
+        _rota_ciz(ax2, rota_dlalt, '#58a6ff')
+        
+        # ─── Panel 3: Eğim Haritası ───
+        im3 = ax3.imshow(slope_map, cmap='YlOrRd', origin='lower', aspect='equal')
+        ax3.set_title('Eğim Haritası', color='#e6edf3', fontsize=11, fontweight='bold')
+        cb3 = plt.colorbar(im3, ax=ax3, shrink=0.8, pad=0.02)
+        cb3.set_label('Eğim (°)', color='#8b949e', fontsize=8)
+        cb3.ax.tick_params(colors='#8b949e', labelsize=7)
+        _rota_ciz(ax3, rota_dlalt, '#58a6ff')
+        
+        # ─── Panel 4: Pürüzlülük Haritası (sadece 5-panel modunda) ───
+        if ax4 is not None:
+            im4 = ax4.imshow(roughness_map, cmap='magma', origin='lower', aspect='equal')
+            ax4.set_title('Pürüzlülük Haritası', color='#e6edf3', fontsize=11, fontweight='bold')
+            cb4 = plt.colorbar(im4, ax=ax4, shrink=0.8, pad=0.02)
+            cb4.set_label('Pürüzlülük (0-1)', color='#8b949e', fontsize=8)
+            cb4.ax.tick_params(colors='#8b949e', labelsize=7)
+            _rota_ciz(ax4, rota_dlalt, '#58a6ff')
+        
+        # ─── Panel 5: Tehlike Haritası (PyCBC) ───
+        im5 = ax5.imshow(tehlike_map, cmap='hot', origin='lower', aspect='equal')
+        ax5.set_title('PyCBC Doppler Tehlike (Kuma Batma Riski)', color='#e6edf3', fontsize=11, fontweight='bold')
+        cb5 = plt.colorbar(im5, ax=ax5, shrink=0.8, pad=0.02)
+        cb5.set_label('Tehlike Skoru', color='#8b949e', fontsize=8)
+        cb5.ax.tick_params(colors='#8b949e', labelsize=7)
+        _rota_ciz(ax5, rota_dlalt, '#58a6ff')
+        
+        # ─── Panel 6: YOLO Krater No-Go ───
+        im6 = ax6.imshow(krater_map, cmap='gray', origin='lower', aspect='equal')
+        ax6.set_title('YOLO Krater Tespiti (No-Go Zones)', color='#e6edf3', fontsize=11, fontweight='bold')
+        _rota_ciz(ax6, rota_dlalt, '#58a6ff')
+        
+        # ─── Panel 7: 3D Yüzey ───
+        ax7.set_facecolor('#161b22')
+        
+        step = max(1, n // 50)
+        X = np.arange(0, n, step)
+        Y = np.arange(0, n, step)
+        X, Y = np.meshgrid(X, Y)
+        Z = heightmap[::step, ::step]
+        
+        # Normalize heightmap for facecolors
+        Z_norm = (Z - Z.min()) / (Z.max() - Z.min() + 1e-8)
+        from matplotlib import cm
+        facecolors = cm.terrain(Z_norm)
+        
+        ax7.plot_surface(X, Y, Z, facecolors=facecolors, alpha=0.85, 
+                        linewidth=0, antialiased=True, shade=True)
+        
+        if rota_dlalt:
+            rx = [d.grid_x for d in rota_dlalt]
+            ry = [d.grid_y for d in rota_dlalt]
+            rz = [d.elevation + 50 for d in rota_dlalt]
+            ax7.plot(rx, ry, rz, color='#58a6ff', linewidth=3, zorder=10)
+        
+        ax7.set_title('3D Arazi Görünümü', color='#e6edf3', fontsize=11, 
+                      fontweight='bold', pad=10)
+        ax7.tick_params(colors='#8b949e', labelsize=5)
+        ax7.xaxis.pane.fill = False
+        ax7.yaxis.pane.fill = False
+        ax7.zaxis.pane.fill = False
+        ax7.xaxis.pane.set_edgecolor('#30363d')
+        ax7.yaxis.pane.set_edgecolor('#30363d')
+        ax7.zaxis.pane.set_edgecolor('#30363d')
+        
+        # ─── Panel 8: Orijinal Heightmap Üzerinde Rota ───
+        if ax8 is not None and orijinal_img is not None:
+            ax8.imshow(orijinal_img, cmap='gray', origin='lower', aspect='equal')
+            ax8.set_title('Orijinal Heightmap + Rota', color='#e6edf3', 
+                         fontsize=11, fontweight='bold')
+            
+            # Rotayı orijinal görsel boyutuna ölçekle
+            oy, ox = orijinal_img.shape
+            sx = ox / n
+            sy = oy / n
+            
+            _rota_ciz(ax8, rota_dlalt, '#58a6ff', '-', 2.5, 'DL-ALT', sx, sy)
+            _rota_ciz(ax8, rota_dijkstra, '#bc8cff', '--', 2.0, 'Dijkstra', sx, sy)
+            _baslangic_hedef_ciz(ax8, rota_dlalt, sx, sy)
+            _landmark_ciz(ax8, landmarks, sx, sy)
+            
+            ax8.legend(loc='upper right', fontsize=7, facecolor='#161b22', 
+                      edgecolor='#30363d', labelcolor='#e6edf3', framealpha=0.9)
+
+        
+        plt.tight_layout()
+        plt.savefig(kaydet, dpi=150, bbox_inches='tight', 
+                   facecolor=fig.get_facecolor())
+        plt.close()
+        
+        print(f"\n  Görselleştirme kaydedildi: {kaydet}")
+
+
+# ============================================================================
+# 7. ANA PROGRAM
+# ============================================================================
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("  AY YÜZEYİ DL-ALT ROTA OPTİMİZASYONU")
+    print("  Deep Learning + A* + Landmarks + Triangle Inequality")
+    print("=" * 70)
+    
+    GRID_BOYUTU = 100  # 100×100 = 10.000 düğüm
+    
+    # Gerçek heightmap dosya yolu
+    HEIGHTMAP_DOSYA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                   "full_moonfesatan.png")
+    
+    # Test görsellerinden YOLO için bir görsel seçelim (moon_heightmap YOLO için çok farklı görünebilir)
+    # Test klasöründeki bir görseli kullan
+    YOLO_TEST_GORSEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "images", "test3.png")
+    
+    # ── 1. Arazi Verisi Yükleme ──
+    if os.path.exists(HEIGHTMAP_DOSYA):
+        print(f"\n[1/7] Gerçek Ay heightmap'i yükleniyor...")
+        yukleyici = AyHeightmapYukleyici(
+            dosya_yolu=HEIGHTMAP_DOSYA,
+            grid_boyutu=GRID_BOYUTU,
+            irtifa_min=-2000.0,   # Siyah → -2000m (derin krater/çukur)
+            irtifa_max=2000.0     # Beyaz → +2000m (yüksek tepe)
+        )
+        heightmap, roughness_map, crater_rim_map = yukleyici.yukle()
+        veri_kaynak = "Gerçek Heightmap"
+    else:
+        print(f"\n[1/7] Heightmap bulunamadı ({HEIGHTMAP_DOSYA})")
+        print("       Sentetik arazi üretiliyor...")
+        uretici = AyAraziUretici(grid_boyutu=GRID_BOYUTU, seed=42)
+        heightmap, roughness_map, crater_rim_map = uretici.arazi_uret()
+        veri_kaynak = "Sentetik"
+    
+    # ── 2. YOLO Krater Tespiti ──
+    print("\n[2/7] YOLO ile krater tespiti yapılıyor...")
+    krater_haritasi = np.zeros((GRID_BOYUTU, GRID_BOYUTU), dtype=bool)
+    if os.path.exists(YOLO_TEST_GORSEL):
+        tespitci = KraterTespitci(grid_boyutu=GRID_BOYUTU)
+        krater_haritasi = tespitci.tespit_et(YOLO_TEST_GORSEL)
+    else:
+        print(f"  Uyarı: {YOLO_TEST_GORSEL} bulunamadı, krater atlanıyor.")
+        
+    # ── 3. PyCBC Doppler Analizi ──
+    print("\n[3/7] PyCBC Doppler sinyal analizi (Tehlike haritası)...")
+    analizci = RoverDopplerAnalizci(grid_boyutu=GRID_BOYUTU)
+    tehlike_haritasi = analizci.tehlike_haritasi_olustur(heightmap, roughness_map, crater_rim_map)
+    
+    # ── 4. Graf Oluşturma ──
+    print(f"\n[4/7] Ay yüzeyi grafı oluşturuluyor ({veri_kaynak})...")
+    ay_yuzeyi = AyYuzeyi(grid_boyutu=GRID_BOYUTU)
+    ay_yuzeyi.graf_olustur(heightmap, roughness_map, crater_rim_map)
+    
+    # Krater ve tehlike verilerini düğümlere uygula ve kenar maliyetlerini güncelle
+    ay_yuzeyi.set_krater_haritasi(krater_haritasi)
+    ay_yuzeyi.set_tehlike_haritasi(tehlike_haritasi)
+    # Yeni eklentilerden sonra kenarları bir daha güncelle
+    ay_yuzeyi.maliyetleri_guncelle(0.0)
+    
+    # ── 5. DL-ALT Algoritmasını Hazırla ──
+    print("\n[5/7] DL-ALT algoritması hazırlanıyor (Tehlike ve Krater maliyetleriyle)...")
+    dlalt = AyDLALT(ay_yuzeyi)
+    dlalt.landmark_seciciyi_egit(epochs=80)
+    dlalt.landmarklari_sec(k=8)
+    
+    # ── 6. Rota Bulma ──
+    # Başlangıç: Yüksek bölge
+    # Hedef: Karşı köşe
+    baslangic_x, baslangic_y = 10, 10
+    hedef_x, hedef_y = 90, 90
+    baslangic = AyYuzeyi._dugum_id(baslangic_x, baslangic_y)
+    hedef = AyYuzeyi._dugum_id(hedef_x, hedef_y)
+    
+    print(f"\n[6/7] Rota aranıyor: ({baslangic_x},{baslangic_y}) → ({hedef_x},{hedef_y})")
+    
+    # DL-ALT ile rota bul
+    print("\n  ── DL-ALT Araması ──")
+    import time
+    
+    t0 = time.time()
+    sonuc_dlalt = dlalt.dl_alt_rota_bul(baslangic, hedef)
+    dlalt_sure = time.time() - t0
+    
+    rota_dlalt = None
+    maliyet_dlalt = 0
+    if sonuc_dlalt:
+        rota_dlalt, maliyet_dlalt = sonuc_dlalt
+        print(f"  Maliyet: {maliyet_dlalt:.1f}")
+        print(f"  Rota uzunluğu: {len(rota_dlalt)} düğüm")
+        print(f"  Süre: {dlalt_sure:.3f}s")
+    
+    # Dijkstra ile karşılaştırma
+    print("\n  ── Dijkstra Araması ──")
+    t0 = time.time()
+    sonuc_dijkstra = ay_yuzeyi.dijkstra_rota_bul(baslangic, hedef)
+    dijkstra_sure = time.time() - t0
+    
+    rota_dijkstra = None
+    maliyet_dijkstra = 0
+    if sonuc_dijkstra:
+        rota_dijkstra, maliyet_dijkstra = sonuc_dijkstra
+        print(f"  Maliyet: {maliyet_dijkstra:.1f}")
+        print(f"  Rota uzunluğu: {len(rota_dijkstra)} düğüm")
+        print(f"  Süre: {dijkstra_sure:.3f}s")
+    
+    # Karşılaştırma
+    if sonuc_dlalt and sonuc_dijkstra:
+        print("\n  ── Karşılaştırma ──")
+        maliyet_fark = abs(maliyet_dlalt - maliyet_dijkstra) / maliyet_dijkstra * 100
+        print(f"  Maliyet farkı: %{maliyet_fark:.2f}")
+        hiz_kazanci = dijkstra_sure / dlalt_sure if dlalt_sure > 0 else float('inf')
+        print(f"  Hız kazancı: {hiz_kazanci:.1f}x")
+    
+    # ── 7. Görselleştirme ──
+    print("\n[7/7] Görselleştirme oluşturuluyor...")
+    AyGorsellestirici.gorsellestir(
+        ay_yuzeyi=ay_yuzeyi,
+        rota_dlalt=rota_dlalt,
+        rota_dijkstra=rota_dijkstra,
+        landmarks=dlalt.landmarks,
+        baslik=f"Ay Yüzeyi YZ Rota Planlayıcı (DL-ALT, YOLO, PyCBC) — {veri_kaynak}",
+        kaydet="lunar_route_result.png",
+        orijinal_heightmap_dosya=YOLO_TEST_GORSEL if os.path.exists(YOLO_TEST_GORSEL) else None
+    )
+    
+    # ── Bonus: Zaman Bağımlı Rota ──
+    print("\n[BONUS] Zaman bağımlı rota testi (6 saat sonra)...")
+    sonuc_zaman = dlalt.dl_alt_rota_bul(baslangic, hedef, zaman_saat=6.0)
+    if sonuc_zaman and sonuc_dlalt:
+        rota_zaman, maliyet_zaman = sonuc_zaman
+        print(f"  t=0h maliyeti:  {maliyet_dlalt:.1f}")
+        print(f"  t=6h maliyeti:  {maliyet_zaman:.1f}")
+        degisim = (maliyet_zaman - maliyet_dlalt) / maliyet_dlalt * 100
+        print(f"  Maliyet değişimi: %{degisim:+.2f}")
+    
+    print("\n" + "=" * 70)
+    print("  Tamamlandı!")
+    print("=" * 70)
